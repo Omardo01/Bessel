@@ -55,68 +55,45 @@ class BesselNN(nn.Module):
         # Capa de salida
         layers.append(nn.Linear(hidden_neurons, output_size))
 
-        self.model = nn.Sequential(*layers)
+        self.feature_extractor = nn.Sequential(*layers)
 
     def forward(self, x):
-        return self.model(x)
+        # Incorporamos las condiciones de frontera analíticas:
+        #   R(0) = 1  y  R'(0) = 0
+        # Mediante la transformación  R(x) = 1 + x^2 * g(x)
+        g = self.feature_extractor(x)
+        return 1.0 + (x ** 2) * g
 
 # Instanciamos la red
 model = BesselNN(hidden_layers=3, hidden_neurons=20).to(device)
 
 # ======================================
-# 3. Funciones auxiliares para derivadas
-# ======================================
-def first_derivative(model, x):
-    # NO usar clone().detach()
-    # Basta con asumir que x.requires_grad_(True) se hace afuera
-    R = model(x)
-    dRdx = torch.autograd.grad(
-        R, x,
-        grad_outputs=torch.ones_like(R),
-        create_graph=True
-    )[0]
-    return dRdx
-
-def second_derivative(model, x):
-    # Calculamos R y su primera derivada sin romper la conexión
-    R = model(x)
-    dRdx = torch.autograd.grad(
-        R, x,
-        grad_outputs=torch.ones_like(R),
-        create_graph=True
-    )[0]
-
-    # dRdx sigue conectado al grafo
-    d2Rdx2 = torch.autograd.grad(
-        dRdx, x,
-        grad_outputs=torch.ones_like(dRdx),
-        create_graph=True
-    )[0]
-    return d2Rdx2
-
-# ======================================
-# 4. Definición de la función de pérdida (residuo + frontera)
+# 3. Definición de la función de pérdida (residuo)
 # ======================================
 
 def loss_function(model, rho_col):
-    rho_col.requires_grad_(True)
+    # Aseguramos que rho_col participe en el grafo sin crear nuevas copias costosas
+    rho_col = rho_col.detach().requires_grad_(True)
 
     R_pred = model(rho_col)
-    dR = first_derivative(model, rho_col)
-    d2R = second_derivative(model, rho_col)
+
+    dR = torch.autograd.grad(
+        R_pred,
+        rho_col,
+        grad_outputs=torch.ones_like(R_pred),
+        create_graph=True
+    )[0]
+
+    d2R = torch.autograd.grad(
+        dR,
+        rho_col,
+        grad_outputs=torch.ones_like(dR),
+        create_graph=True
+    )[0]
 
     # Ecuación de Bessel (n=0) -> residual
-    residual = (rho_col**2)*d2R + rho_col*dR + (rho_col**2)*R_pred
-    loss_pde = torch.mean(residual**2)
-
-    # Condiciones de frontera en rho=0
-    eps = torch.tensor([1e-5], dtype=torch.float32, device=device, requires_grad=True)
-    R_bc0 = model(eps)
-    dR_bc0 = first_derivative(model, eps)
-
-    loss_bc = (R_bc0 - 1.0)**2 + (dR_bc0 - 0.0)**2
-
-    return loss_pde + torch.mean(loss_bc)
+    residual = (rho_col**2) * d2R + rho_col * dR + (rho_col**2) * R_pred
+    return torch.mean(residual**2)
 
 # ======================================
 # 5. Generación de datos (SOLO puntos de colación)
@@ -165,7 +142,7 @@ else:
     raise ValueError("COLLOCATION_STRATEGY no reconocida.")
 
 # Tensor final de colación
-rho_col = torch.tensor(rho_col_np, dtype=torch.float32).view(-1, 1).to(device)
+rho_col = torch.from_numpy(rho_col_np.astype(np.float32)).view(-1, 1).to(device)
 
 
 optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -198,7 +175,7 @@ model.eval()
 
 # Puntos de prueba para graficar
 rho_test_np = np.linspace(0, rho_max, 300)
-rho_test = torch.tensor(rho_test_np, dtype=torch.float32).view(-1,1).to(device)
+rho_test = torch.from_numpy(rho_test_np.astype(np.float32)).view(-1, 1).to(device)
 
 # Medir tiempo de inferencia de la PINN
 start_inference = time.time()
